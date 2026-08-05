@@ -25,26 +25,152 @@ PURGE_INTERVAL = 2
 # ---------------- کلاینت تلگرام ----------------
 client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
 
+# ---------------- فیلتر بسیار سخت‌گیرانه و دقیق ----------------
+def is_invalid_sni(s):
+    if not s: 
+        return False
+    s = s.lower().strip()
+    
+    # مسدودسازی استفاده از آی‌پی به جای دامنه
+    if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", s): 
+        return True
+        
+    # لیست سیاه بسیار گسترده دامنه‌های زباله و کلودفلر رایگان
+    bad_domains = [
+        "workers.dev", "pages.dev", "fastly.net", "ndjp.net", "ccwu.cc",
+        "chickenkiller.com", "09vpn.com", "gamelistak.com", "boobie.eu.cc",
+        "pink-perfect.ru", "stardevs.top", "ziqiyun.xyz", "rooster465.autos",
+        "myfymain.com", "fromblancwithlove.com", "octopusss", "picassooo.info",
+        "mammad.shop", "g9q.fun", "rainzone.ir", "samanehha.co", "s3-cloud.xyz",
+        "ignorelist.com", "solid-dev1.online", "twilightparadox.com", "bexum.fun",
+        "cgiproxy", "connectv.net", "cnae.top", "9889888.xyz", "cfvip.lol",
+        "sajadi.lol", "ir" # دامنه های .ir برای خروج از کشور منطقی نیستند و بلاک میشوند
+    ]
+    if any(bd in s for bd in bad_domains): 
+        return True
+        
+    return False
+
+def is_burned_reality_sni(s):
+    s = s.lower().strip()
+    burned = [
+        "yahoo", "microsoft", "cloudflare", "sony", "apple", "icloud", 
+        "amazon", "max.ru", "vk-portal", "deepl", "tradingview", "yandex",
+        "mozilla", "vk.com", "speedtest", "zoom.us", "google", "ya.ru",
+        "alibaba", "kinopoisk", "vk.ru", "sberbank", "ebay", "asus.com"
+    ]
+    if any(b in s for b in burned): 
+        return True
+    return False
+
+def is_iran_friendly_config(link):
+    """
+    قوانین جدید بر اساس تحلیل رفتاری DPI:
+    1. تروجان مسدود است.
+    2. Vless بدون TLS/Reality مسدود است.
+    3. داشتن fp معتبر (chrome/firefox/edge) برای Vless الزامی است.
+    """
+    try:
+        CF_TLS_PORTS = {443, 2053, 2083, 2087, 8443, 2096}
+        CF_HTTP_PORTS = {80, 8080, 8880, 2052, 2082, 2086, 2095}
+        
+        # تروجان دراپ می‌شود
+        if link.startswith("trojan://"):
+            return False
+
+        if link.startswith("vmess://"):
+            b64 = link[8:]
+            b64 += "=" * ((4 - len(b64) % 4) % 4)
+            decoded = json.loads(base64.b64decode(b64).decode('utf-8'))
+            port = int(decoded.get("port", 443))
+            net = decoded.get("net", "tcp")
+            tls = decoded.get("tls", "")
+            sni = decoded.get("sni", "")
+            host = decoded.get("host", "")
+            
+            if net == "tcp" and tls != "tls": return False
+            if tls != "tls" and port not in CF_HTTP_PORTS: return False
+            if tls == "tls" and port not in CF_TLS_PORTS: return False
+            if is_invalid_sni(sni) or is_invalid_sni(host): return False
+            return True
+
+        elif link.startswith("ss://"):
+            parsed = urlparse(link)
+            port = parsed.port
+            if not port: return False
+            # SS روی پورت 443 مسدود است، اما روی 8080 اوکی است
+            if port == 443: return False
+            if port not in CF_HTTP_PORTS and port not in [8443, 2053]: return False
+            return True
+
+        elif link.startswith("vless://"):
+            parsed = urlparse(link)
+            port = parsed.port if parsed.port else 443
+            params = parse_qs(parsed.query)
+            
+            security = params.get("security", [""])[0]
+            net_type = params.get("type", ["tcp"])[0]
+            fp = params.get("fp", [""])[0]
+            pbk = params.get("pbk", [""])[0]
+            sni = params.get("sni", [""])[0]
+            host = params.get("host", [""])[0]
+            
+            actual_sni = sni or host or parsed.hostname
+            if is_invalid_sni(actual_sni): return False
+            
+            # VLESS بدون امنیت (none) به طور قطع مسدود می‌شود
+            if security not in ["tls", "reality"]: 
+                return False
+
+            # دارا بودن اثر انگشت معتبر الزامی است
+            if fp not in ["chrome", "firefox", "edge", "safari"]: 
+                return False
+            
+            if security == "reality":
+                if not pbk: return False
+                if is_burned_reality_sni(actual_sni): return False
+                
+            elif security == "tls":
+                if port not in CF_TLS_PORTS: return False
+                
+            return True
+            
+    except Exception:
+        return False
+    return False
+
 # ---------------- پاکسازی دیتابیس ----------------
 def clean_database_with_heuristics():
-    print("🔍 اسکن دیتابیس برای حذف کانفیگ‌های ناسازگار (فیلتر ورودی غیرفعال شده)...")
+    print("🔍 در حال اسکن دیتابیس برای حذف کانفیگ‌های فاقد استاندارد جدید...")
     if not os.path.exists(DB_FILE):
         return
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-
+    
     try:
         c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tested_configs'")
         if not c.fetchone():
             conn.close()
             return
 
-        c.execute("SELECT COUNT(*) FROM tested_configs")
-        count = c.fetchone()[0]
-        print(f"✅ دیتابیس شامل {count} کانفیگ است. هیچ کانفیگی حذف نخواهد شد (قواعد فیلترسازی ورودی حذف شدند).\n")
+        c.execute("SELECT config_hash FROM tested_configs")
+        rows = c.fetchall()
+        removed_count = 0
+        
+        for row in rows:
+            config_hash = row[0]
+            if not is_iran_friendly_config(config_hash):
+                c.execute("DELETE FROM tested_configs WHERE config_hash=?", (config_hash,))
+                removed_count += 1
+                
+        conn.commit()
+        if removed_count > 0:
+            print(f"🧹 پاکسازی دیتابیس: {removed_count} کانفیگ قدیمی ناسازگار از دیتابیس حذف شدند.\n")
+        else:
+            print("✅ دیتابیس تمیز است.\n")
     except Exception as e:
-        print(f"⚠️ خطا در بررسی دیتابیس: {e}")
+        print(f"⚠️ خطا در پاکسازی دیتابیس: {e}")
     finally:
         conn.close()
 
@@ -102,8 +228,8 @@ def extract_configs():
                 if msg.text:
                     found = re.findall(r'(?:vless|vmess|trojan|ss)://\S+', msg.text)
                     for link in found:
-                        # حذف فیلترگذاری: همه لینک‌های پیدا شده برای تست در نظر گرفته می‌شوند
-                        configs.add(link)
+                        if is_iran_friendly_config(link):
+                            configs.add(link)
     return list(configs)
 
 def init_run_counter():
@@ -256,11 +382,11 @@ def parse_link_to_outbound(link):
             if decoded.get("net") == "ws":
                 out["streamSettings"]["wsSettings"] = {
                     "path": decoded.get("path", "/"),
-                    "headers": {"Host": decoded.get("host", decoded["add"]) } if decoded.get("host") else {}
+                    "headers": {"Host": decoded.get("host", decoded["add"])} if decoded.get("host") else {}
                 }
             if decoded.get("tls") == "tls":
                 out["streamSettings"]["security"] = "tls"
-                out["streamSettings"]["tlsSettings"] = {"serverName": decoded.get("sni", decoded["add"]) }
+                out["streamSettings"]["tlsSettings"] = {"serverName": decoded.get("sni", decoded["add"])}
             return out
 
         elif link.startswith("ss://"):
@@ -583,7 +709,7 @@ if __name__ == "__main__":
     print(f"📊 شمارنده اجرا: {counter} / {PURGE_INTERVAL} → اجرای عادی")
     print("📡 دریافت کانفیگ‌ها از تلگرام...")
     raw = extract_configs()
-    print(f"📋 {len(raw)} کانفیگ یکتا پس از استخراج، برای تست آماده شد.\n")
+    print(f"📋 {len(raw)} کانفیگ یکتا پس از فیلترینگ بسیار سخت‌گیرانه، برای تست آماده شد.\n")
 
     if not raw:
         print("⚠️ هیچ کانفیگ سالمی پیدا نشد!")
