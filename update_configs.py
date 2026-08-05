@@ -42,14 +42,20 @@ def extract_host(link):
 
 def get_country(host):
     """تبدیل دامنه به IP و استخراج کشور با استفاده از کش دیتابیس برای جلوگیری از محدودیت API"""
-    if not host:
+    if not host or not isinstance(host, str):
+        return None
+        
+    host = host.strip()
+    
+    # فیلتر اولیه: دامنه‌های طولانی‌تر از حد استاندارد شبکه مستقیماً رد می‌شوند
+    if len(host) > 253:
         return None
     
     # تبدیل دامنه به IP (در صورت نیاز)
     try:
         ip = socket.gethostbyname(host)
-    except socket.gaierror:
-        return None # در صورتی که دامنه معتبر نباشد یا DNS پاسخ ندهد
+    except Exception:  # تغییر مهم: اینجا به جای فقط socket.gaierror، تمام خطاها از جمله UnicodeError را می‌گیریم
+        return None 
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
