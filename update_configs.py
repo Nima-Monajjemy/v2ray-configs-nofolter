@@ -1,4 +1,4 @@
-import os, re, subprocess, tempfile, json, time, requests, shutil, base64, sqlite3
+import os, re, subprocess, tempfile, json, time, requests, shutil, base64, sqlite3, socket
 from urllib.parse import urlparse, parse_qs
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -25,123 +25,76 @@ PURGE_INTERVAL = 2
 # ---------------- کلاینت تلگرام ----------------
 client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
 
-# ---------------- فیلتر بسیار سخت‌گیرانه و دقیق ----------------
-def is_invalid_sni(s):
-    if not s: 
-        return False
-    s = s.lower().strip()
-    
-    # مسدودسازی استفاده از آی‌پی به جای دامنه
-    if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", s): 
-        return True
-        
-    # لیست سیاه بسیار گسترده دامنه‌های زباله و کلودفلر رایگان
-    bad_domains = [
-        "workers.dev", "pages.dev", "fastly.net", "ndjp.net", "ccwu.cc",
-        "chickenkiller.com", "09vpn.com", "gamelistak.com", "boobie.eu.cc",
-        "pink-perfect.ru", "stardevs.top", "ziqiyun.xyz", "rooster465.autos",
-        "myfymain.com", "fromblancwithlove.com", "octopusss", "picassooo.info",
-        "mammad.shop", "g9q.fun", "rainzone.ir", "samanehha.co", "s3-cloud.xyz",
-        "ignorelist.com", "solid-dev1.online", "twilightparadox.com", "bexum.fun",
-        "cgiproxy", "connectv.net", "cnae.top", "9889888.xyz", "cfvip.lol",
-        "sajadi.lol", "ir" # دامنه های .ir برای خروج از کشور منطقی نیستند و بلاک میشوند
-    ]
-    if any(bd in s for bd in bad_domains): 
-        return True
-        
-    return False
-
-def is_burned_reality_sni(s):
-    s = s.lower().strip()
-    burned = [
-        "yahoo", "microsoft", "cloudflare", "sony", "apple", "icloud", 
-        "amazon", "max.ru", "vk-portal", "deepl", "tradingview", "yandex",
-        "mozilla", "vk.com", "speedtest", "zoom.us", "google", "ya.ru",
-        "alibaba", "kinopoisk", "vk.ru", "sberbank", "ebay", "asus.com"
-    ]
-    if any(b in s for b in burned): 
-        return True
-    return False
-
-def is_iran_friendly_config(link):
-    """
-    قوانین جدید بر اساس تحلیل رفتاری DPI:
-    1. تروجان مسدود است.
-    2. Vless بدون TLS/Reality مسدود است.
-    3. داشتن fp معتبر (chrome/firefox/edge) برای Vless الزامی است.
-    """
+# ---------------- فیلتر جغرافیایی (ایالات متحده) ----------------
+def extract_host(link):
+    """استخراج آدرس سرور (IP یا دامنه) از لینک کانفیگ"""
     try:
-        CF_TLS_PORTS = {443, 2053, 2083, 2087, 8443, 2096}
-        CF_HTTP_PORTS = {80, 8080, 8880, 2052, 2082, 2086, 2095}
-        
-        # تروجان دراپ می‌شود
-        if link.startswith("trojan://"):
-            return False
-
         if link.startswith("vmess://"):
             b64 = link[8:]
             b64 += "=" * ((4 - len(b64) % 4) % 4)
             decoded = json.loads(base64.b64decode(b64).decode('utf-8'))
-            port = int(decoded.get("port", 443))
-            net = decoded.get("net", "tcp")
-            tls = decoded.get("tls", "")
-            sni = decoded.get("sni", "")
-            host = decoded.get("host", "")
-            
-            if net == "tcp" and tls != "tls": return False
-            if tls != "tls" and port not in CF_HTTP_PORTS: return False
-            if tls == "tls" and port not in CF_TLS_PORTS: return False
-            if is_invalid_sni(sni) or is_invalid_sni(host): return False
-            return True
-
-        elif link.startswith("ss://"):
+            return decoded.get("add", "")
+        else:
             parsed = urlparse(link)
-            port = parsed.port
-            if not port: return False
-            # SS روی پورت 443 مسدود است، اما روی 8080 اوکی است
-            if port == 443: return False
-            if port not in CF_HTTP_PORTS and port not in [8443, 2053]: return False
-            return True
-
-        elif link.startswith("vless://"):
-            parsed = urlparse(link)
-            port = parsed.port if parsed.port else 443
-            params = parse_qs(parsed.query)
-            
-            security = params.get("security", [""])[0]
-            net_type = params.get("type", ["tcp"])[0]
-            fp = params.get("fp", [""])[0]
-            pbk = params.get("pbk", [""])[0]
-            sni = params.get("sni", [""])[0]
-            host = params.get("host", [""])[0]
-            
-            actual_sni = sni or host or parsed.hostname
-            if is_invalid_sni(actual_sni): return False
-            
-            # VLESS بدون امنیت (none) به طور قطع مسدود می‌شود
-            if security not in ["tls", "reality"]: 
-                return False
-
-            # دارا بودن اثر انگشت معتبر الزامی است
-            if fp not in ["chrome", "firefox", "edge", "safari"]: 
-                return False
-            
-            if security == "reality":
-                if not pbk: return False
-                if is_burned_reality_sni(actual_sni): return False
-                
-            elif security == "tls":
-                if port not in CF_TLS_PORTS: return False
-                
-            return True
-            
+            return parsed.hostname
     except Exception:
+        return ""
+
+def get_country(host):
+    """تبدیل دامنه به IP و استخراج کشور با استفاده از کش دیتابیس برای جلوگیری از محدودیت API"""
+    if not host:
+        return None
+    
+    # تبدیل دامنه به IP (در صورت نیاز)
+    try:
+        ip = socket.gethostbyname(host)
+    except socket.gaierror:
+        return None # در صورتی که دامنه معتبر نباشد یا DNS پاسخ ندهد
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    # بررسی حافظه پنهان
+    c.execute("SELECT country FROM ip_cache WHERE ip=?", (ip,))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return row[0]
+    
+    # اگر در دیتابیس نبود، از API استفاده کن
+    try:
+        resp = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=5)
+        if resp.status_code == 200:
+            country = resp.json().get("countryCode")
+            
+            # ذخیره در کش
+            c.execute("INSERT OR REPLACE INTO ip_cache (ip, country) VALUES (?, ?)", (ip, country))
+            conn.commit()
+            conn.close()
+            
+            # مکث برای جلوگیری از بن شدن توسط API (محدودیت 45 درخواست در دقیقه)
+            time.sleep(1.35) 
+            return country
+    except Exception:
+        pass
+    
+    conn.close()
+    return None
+
+def is_us_location_config(link):
+    """بررسی اینکه آیا سرور کانفیگ در آمریکا (US) قرار دارد یا خیر"""
+    host = extract_host(link)
+    if not host:
         return False
+        
+    country = get_country(host)
+    if country == "US":
+        return True
     return False
 
 # ---------------- پاکسازی دیتابیس ----------------
 def clean_database_with_heuristics():
-    print("🔍 در حال اسکن دیتابیس برای حذف کانفیگ‌های فاقد استاندارد جدید...")
+    print("🔍 در حال اسکن دیتابیس برای حذف کانفیگ‌هایی که در آمریکا نیستند...")
     if not os.path.exists(DB_FILE):
         return
 
@@ -160,21 +113,29 @@ def clean_database_with_heuristics():
         
         for row in rows:
             config_hash = row[0]
-            if not is_iran_friendly_config(config_hash):
+            if not is_us_location_config(config_hash):
                 c.execute("DELETE FROM tested_configs WHERE config_hash=?", (config_hash,))
                 removed_count += 1
                 
         conn.commit()
         if removed_count > 0:
-            print(f"🧹 پاکسازی دیتابیس: {removed_count} کانفیگ قدیمی ناسازگار از دیتابیس حذف شدند.\n")
+            print(f"🧹 پاکسازی دیتابیس: {removed_count} کانفیگ خارج از آمریکا از دیتابیس حذف شدند.\n")
         else:
-            print("✅ دیتابیس تمیز است.\n")
+            print("✅ دیتابیس تمیز است و تمامی کانفیگ‌ها متعلق به آمریکا هستند.\n")
     except Exception as e:
         print(f"⚠️ خطا در پاکسازی دیتابیس: {e}")
     finally:
         conn.close()
 
 # ---------------- توابع پایگاه داده و وضعیت ----------------
+def init_ip_cache():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS ip_cache
+                 (ip TEXT PRIMARY KEY, country TEXT)''')
+    conn.commit()
+    conn.close()
+
 def init_fetch_state():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -224,11 +185,13 @@ def extract_configs():
                 print(f"📨 {channel}: {len(new_messages)} پیام جدید (آخرین ID: {max_id})")
             else:
                 print(f"📨 {channel}: پیام جدیدی یافت نشد.")
+            
+            # استخراج و فیلتر لوکیشن
             for msg in new_messages:
                 if msg.text:
                     found = re.findall(r'(?:vless|vmess|trojan|ss)://\S+', msg.text)
                     for link in found:
-                        if is_iran_friendly_config(link):
+                        if is_us_location_config(link):
                             configs.add(link)
     return list(configs)
 
@@ -695,6 +658,7 @@ def perform_purge():
 
 if __name__ == "__main__":
     init_db()
+    init_ip_cache() # اضافه شدن دیتابیس لوکیشن IPها
     clean_database_with_heuristics()
     init_fetch_state()
     init_run_counter()
@@ -707,12 +671,12 @@ if __name__ == "__main__":
         exit(0)
 
     print(f"📊 شمارنده اجرا: {counter} / {PURGE_INTERVAL} → اجرای عادی")
-    print("📡 دریافت کانفیگ‌ها از تلگرام...")
+    print("📡 دریافت کانفیگ‌ها از تلگرام و بررسی موقعیت جغرافیایی...")
     raw = extract_configs()
-    print(f"📋 {len(raw)} کانفیگ یکتا پس از فیلترینگ بسیار سخت‌گیرانه، برای تست آماده شد.\n")
+    print(f"📋 {len(raw)} کانفیگ یکتای ایالات متحده (US) استخراج و برای تست آماده شد.\n")
 
     if not raw:
-        print("⚠️ هیچ کانفیگ سالمی پیدا نشد!")
+        print("⚠️ هیچ کانفیگ سالمی با لوکیشن آمریکا پیدا نشد!")
         set_run_counter(counter + 1)
         exit(1)
 
