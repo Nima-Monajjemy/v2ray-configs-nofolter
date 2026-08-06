@@ -25,7 +25,7 @@ PURGE_INTERVAL = 2
 # ---------------- کلاینت تلگرام ----------------
 client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
 
-# ---------------- فیلتر جغرافیایی (ایالات متحده) ----------------
+# ---------------- فیلتر جغرافیایی (ایالات متحده و بدون CDN) ----------------
 def extract_host(link):
     """استخراج آدرس سرور (IP یا دامنه) از لینک کانفیگ"""
     try:
@@ -40,67 +40,83 @@ def extract_host(link):
     except Exception:
         return ""
 
-def get_country(host):
-    """تبدیل دامنه به IP و استخراج کشور با استفاده از کش دیتابیس برای جلوگیری از محدودیت API"""
+def get_ip_info(host):
+    """استخراج کشور، ISP و نام سازمان برای شناسایی سرورهای واقعی از CDNها"""
     if not host or not isinstance(host, str):
-        return None
+        return None, None, None
         
     host = host.strip()
     
     # فیلتر اولیه: دامنه‌های طولانی‌تر از حد استاندارد شبکه مستقیماً رد می‌شوند
     if len(host) > 253:
-        return None
+        return None, None, None
     
-    # تبدیل دامنه به IP (در صورت نیاز)
+    # تبدیل دامنه به IP
     try:
         ip = socket.gethostbyname(host)
-    except Exception:  # تغییر مهم: اینجا به جای فقط socket.gaierror، تمام خطاها از جمله UnicodeError را می‌گیریم
-        return None 
+    except Exception:
+        return None, None, None
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
     # بررسی حافظه پنهان
-    c.execute("SELECT country FROM ip_cache WHERE ip=?", (ip,))
+    c.execute("SELECT country, isp, org FROM ip_info_cache WHERE ip=?", (ip,))
     row = c.fetchone()
     if row:
         conn.close()
-        return row[0]
+        return row[0], row[1], row[2]
     
-    # اگر در دیتابیس نبود، از API استفاده کن
+    # دریافت اطلاعات کامل‌تر از API شامل isp و org
     try:
-        resp = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=5)
+        resp = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,isp,org", timeout=5)
         if resp.status_code == 200:
-            country = resp.json().get("countryCode")
+            data = resp.json()
+            country = data.get("countryCode")
+            isp = data.get("isp", "")
+            org = data.get("org", "")
             
-            # ذخیره در کش
-            c.execute("INSERT OR REPLACE INTO ip_cache (ip, country) VALUES (?, ?)", (ip, country))
+            c.execute("INSERT OR REPLACE INTO ip_info_cache (ip, country, isp, org) VALUES (?, ?, ?, ?)", 
+                      (ip, country, isp, org))
             conn.commit()
             conn.close()
             
             # مکث برای جلوگیری از بن شدن توسط API (محدودیت 45 درخواست در دقیقه)
             time.sleep(1.35) 
-            return country
+            return country, isp, org
     except Exception:
         pass
     
     conn.close()
-    return None
+    return None, None, None
 
 def is_us_location_config(link):
-    """بررسی اینکه آیا سرور کانفیگ در آمریکا (US) قرار دارد یا خیر"""
+    """فیلتر نهایی: سرور باید در آمریکا باشد و CDN نباشد"""
     host = extract_host(link)
     if not host:
         return False
         
-    country = get_country(host)
-    if country == "US":
-        return True
-    return False
+    country, isp, org = get_ip_info(host)
+    
+    # شرط اول: حتما آمریکا باشد
+    if country != "US":
+        return False
+        
+    # لیست سیاه نام شرکت‌های توزیع محتوا (Anycast CDN)
+    cdn_keywords = ['cloudflare', 'fastly', 'akamai', 'cloudfront', 'incapsula', 'sucuri', 'cdn', 'amazon']
+    
+    isp_lower = (isp or "").lower()
+    org_lower = (org or "").lower()
+    
+    # شرط دوم: اگر نام شرکت جزو شبکه‌های توزیع محتوا باشد، کانفیگ رد می‌شود
+    if any(kw in isp_lower or kw in org_lower for kw in cdn_keywords):
+        return False
+        
+    return True
 
 # ---------------- پاکسازی دیتابیس ----------------
 def clean_database_with_heuristics():
-    print("🔍 در حال اسکن دیتابیس برای حذف کانفیگ‌هایی که در آمریکا نیستند...")
+    print("🔍 در حال اسکن دیتابیس برای حذف کانفیگ‌های نامعتبر (خارج از آمریکا یا CDN)...")
     if not os.path.exists(DB_FILE):
         return
 
@@ -125,9 +141,9 @@ def clean_database_with_heuristics():
                 
         conn.commit()
         if removed_count > 0:
-            print(f"🧹 پاکسازی دیتابیس: {removed_count} کانفیگ خارج از آمریکا از دیتابیس حذف شدند.\n")
+            print(f"🧹 پاکسازی دیتابیس: {removed_count} کانفیگ نامعتبر از دیتابیس حذف شدند.\n")
         else:
-            print("✅ دیتابیس تمیز است و تمامی کانفیگ‌ها متعلق به آمریکا هستند.\n")
+            print("✅ دیتابیس تمیز است و تمامی کانفیگ‌ها معتبر هستند.\n")
     except Exception as e:
         print(f"⚠️ خطا در پاکسازی دیتابیس: {e}")
     finally:
@@ -137,8 +153,8 @@ def clean_database_with_heuristics():
 def init_ip_cache():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS ip_cache
-                 (ip TEXT PRIMARY KEY, country TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ip_info_cache
+                 (ip TEXT PRIMARY KEY, country TEXT, isp TEXT, org TEXT)''')
     conn.commit()
     conn.close()
 
@@ -192,7 +208,6 @@ def extract_configs():
             else:
                 print(f"📨 {channel}: پیام جدیدی یافت نشد.")
             
-            # استخراج و فیلتر لوکیشن
             for msg in new_messages:
                 if msg.text:
                     found = re.findall(r'(?:vless|vmess|trojan|ss)://\S+', msg.text)
@@ -664,7 +679,7 @@ def perform_purge():
 
 if __name__ == "__main__":
     init_db()
-    init_ip_cache() # اضافه شدن دیتابیس لوکیشن IPها
+    init_ip_cache()
     clean_database_with_heuristics()
     init_fetch_state()
     init_run_counter()
@@ -679,10 +694,10 @@ if __name__ == "__main__":
     print(f"📊 شمارنده اجرا: {counter} / {PURGE_INTERVAL} → اجرای عادی")
     print("📡 دریافت کانفیگ‌ها از تلگرام و بررسی موقعیت جغرافیایی...")
     raw = extract_configs()
-    print(f"📋 {len(raw)} کانفیگ یکتای ایالات متحده (US) استخراج و برای تست آماده شد.\n")
+    print(f"📋 {len(raw)} کانفیگ یکتای ایالات متحده (US) و بدون CDN استخراج و برای تست آماده شد.\n")
 
     if not raw:
-        print("⚠️ هیچ کانفیگ سالمی با لوکیشن آمریکا پیدا نشد!")
+        print("⚠️ هیچ کانفیگ سالمی پیدا نشد!")
         set_run_counter(counter + 1)
         exit(1)
 
