@@ -8,7 +8,13 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION_STR = os.environ["SESSION_STRING"]
 
+# منابع تلگرامی
 CHANNELS = ["@SOSkeyNET", "@Mrshahabx", "@vslshi"]
+
+# منابع وبی (لینک‌های سابسکریپشن و گیت‌هاب)
+WEB_SOURCES = [
+    "https://raw.githubusercontent.com/Farid-Karimi/Config-Collector/main/mixed_iran.txt"
+]
 
 CONFIG_FILE = "configs.txt"
 DB_FILE = "tested_configs.db"
@@ -183,6 +189,9 @@ def set_last_msg_id(channel, msg_id):
 
 def extract_configs():
     configs = set()
+    
+    # === بخش اول: دریافت از کانال‌های تلگرام ===
+    print("📡 در حال دریافت کانفیگ‌ها از تلگرام...")
     with client:
         for channel in CHANNELS:
             last_id = get_last_msg_id(channel)
@@ -214,6 +223,37 @@ def extract_configs():
                     for link in found:
                         if is_us_location_config(link):
                             configs.add(link)
+
+    # === بخش دوم: دریافت از منابع وب و گیت‌هاب ===
+    print("\n🌐 در حال دریافت کانفیگ‌ها از منابع وب...")
+    for url in WEB_SOURCES:
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                text_content = resp.text.strip()
+                
+                # تلاش برای تبدیل از Base64 به متن ساده
+                try:
+                    decoded_text = base64.b64decode(text_content).decode('utf-8')
+                    text_content = decoded_text
+                except Exception:
+                    pass  # اگر فایل Base64 نبود و متن ساده بود، مشکلی نیست
+                    
+                found = re.findall(r'(?:vless|vmess|trojan|ss)://\S+', text_content)
+                
+                valid_web_configs = 0
+                for link in found:
+                    if is_us_location_config(link):
+                        configs.add(link)
+                        valid_web_configs += 1
+                
+                source_name = url.split('/')[-1]
+                print(f"🔗 منبع {source_name}: {len(found)} کانفیگ یافت شد، {valid_web_configs} مورد منطبق با آمریکا و بدون CDN.")
+            else:
+                print(f"⚠️ خطا در دریافت از وب (کد {resp.status_code}) برای: {url}")
+        except Exception as e:
+            print(f"⚠️ خطای ارتباط با منبع وب: {e}")
+
     return list(configs)
 
 def init_run_counter():
@@ -692,9 +732,8 @@ if __name__ == "__main__":
         exit(0)
 
     print(f"📊 شمارنده اجرا: {counter} / {PURGE_INTERVAL} → اجرای عادی")
-    print("📡 دریافت کانفیگ‌ها از تلگرام و بررسی موقعیت جغرافیایی...")
     raw = extract_configs()
-    print(f"📋 {len(raw)} کانفیگ یکتای ایالات متحده (US) و بدون CDN استخراج و برای تست آماده شد.\n")
+    print(f"\n📋 در مجموع {len(raw)} کانفیگ یکتا استخراج و برای تست آماده شد.\n")
 
     if not raw:
         print("⚠️ هیچ کانفیگ سالمی پیدا نشد!")
