@@ -47,17 +47,14 @@ def extract_host(link):
         return ""
 
 def get_ip_info(host):
-    """استخراج کشور، ISP و نام سازمان برای شناسایی سرورهای واقعی از CDNها"""
+    """استخراج کشور، ISP و نام سازمان"""
     if not host or not isinstance(host, str):
         return None, None, None
         
     host = host.strip()
-    
-    # فیلتر اولیه: دامنه‌های طولانی‌تر از حد استاندارد شبکه مستقیماً رد می‌شوند
     if len(host) > 253:
         return None, None, None
     
-    # تبدیل دامنه به IP
     try:
         ip = socket.gethostbyname(host)
     except Exception:
@@ -65,15 +62,12 @@ def get_ip_info(host):
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    
-    # بررسی حافظه پنهان
     c.execute("SELECT country, isp, org FROM ip_info_cache WHERE ip=?", (ip,))
     row = c.fetchone()
     if row:
         conn.close()
         return row[0], row[1], row[2]
     
-    # دریافت اطلاعات کامل‌تر از API شامل isp و org
     try:
         resp = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode,isp,org", timeout=5)
         if resp.status_code == 200:
@@ -86,8 +80,6 @@ def get_ip_info(host):
                       (ip, country, isp, org))
             conn.commit()
             conn.close()
-            
-            # مکث برای جلوگیری از بن شدن توسط API (محدودیت 45 درخواست در دقیقه)
             time.sleep(1.35) 
             return country, isp, org
     except Exception:
@@ -96,66 +88,62 @@ def get_ip_info(host):
     conn.close()
     return None, None, None
 
-def is_us_location_config(link):
-    """فیلتر نهایی: سرور باید در آمریکا باشد و CDN نباشد"""
+def check_config_location(link):
+    """فیلتر نهایی همراه با برگرداندن دلیل رد شدن برای سیستم شفاف‌سازی"""
     host = extract_host(link)
     if not host:
-        return False
+        return False, "Invalid"
         
     country, isp, org = get_ip_info(host)
-    
-    # شرط اول: حتما آمریکا باشد
-    if country != "US":
-        return False
+    if not country:
+        return False, "Resolution_Failed"
         
-    # لیست سیاه نام شرکت‌های توزیع محتوا (Anycast CDN)
-    cdn_keywords = ['cloudflare', 'fastly', 'akamai', 'cloudfront', 'incapsula', 'sucuri', 'cdn', 'amazon']
+    if country != "US":
+        return False, f"Non_US ({country})"
+        
+    # بلک‌لیست اصلاح شده (amazon حذف شد تا سرورهای واقعی AWS مسدود نشوند)
+    cdn_keywords = ['cloudflare', 'fastly', 'akamai', 'cloudfront', 'incapsula', 'sucuri']
     
     isp_lower = (isp or "").lower()
     org_lower = (org or "").lower()
     
-    # شرط دوم: اگر نام شرکت جزو شبکه‌های توزیع محتوا باشد، کانفیگ رد می‌شود
     if any(kw in isp_lower or kw in org_lower for kw in cdn_keywords):
-        return False
+        return False, "CDN_Blocked"
         
-    return True
+    return True, "Valid_US"
 
 # ---------------- پاکسازی دیتابیس ----------------
 def clean_database_with_heuristics():
     print("🔍 در حال اسکن دیتابیس برای حذف کانفیگ‌های نامعتبر (خارج از آمریکا یا CDN)...")
     if not os.path.exists(DB_FILE):
         return
-
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    
     try:
         c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tested_configs'")
         if not c.fetchone():
             conn.close()
             return
-
         c.execute("SELECT config_hash FROM tested_configs")
         rows = c.fetchall()
         removed_count = 0
-        
         for row in rows:
             config_hash = row[0]
-            if not is_us_location_config(config_hash):
+            is_valid, _ = check_config_location(config_hash)
+            if not is_valid:
                 c.execute("DELETE FROM tested_configs WHERE config_hash=?", (config_hash,))
                 removed_count += 1
-                
         conn.commit()
         if removed_count > 0:
-            print(f"🧹 پاکسازی دیتابیس: {removed_count} کانفیگ نامعتبر از دیتابیس حذف شدند.\n")
+            print(f"🧹 پاکسازی دیتابیس: {removed_count} کانفیگ نامعتبر حذف شدند.\n")
         else:
-            print("✅ دیتابیس تمیز است و تمامی کانفیگ‌ها معتبر هستند.\n")
+            print("✅ دیتابیس تمیز است.\n")
     except Exception as e:
         print(f"⚠️ خطا در پاکسازی دیتابیس: {e}")
     finally:
         conn.close()
 
-# ---------------- توابع پایگاه داده و وضعیت ----------------
+# ---------------- توابع دیتابیس ----------------
 def init_ip_cache():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -186,75 +174,6 @@ def set_last_msg_id(channel, msg_id):
     c.execute("INSERT OR REPLACE INTO fetch_state VALUES (?, ?)", (channel, msg_id))
     conn.commit()
     conn.close()
-
-def extract_configs():
-    configs = set()
-    
-    # === بخش اول: دریافت از کانال‌های تلگرام ===
-    print("📡 در حال دریافت کانفیگ‌ها از تلگرام...")
-    with client:
-        for channel in CHANNELS:
-            last_id = get_last_msg_id(channel)
-            new_messages = []
-            max_id = last_id
-            try:
-                messages = client.iter_messages(
-                    channel,
-                    limit=200,
-                    min_id=last_id + 1,
-                    reverse=False
-                )
-                for msg in messages:
-                    new_messages.append(msg)
-                    if msg.id > max_id:
-                        max_id = msg.id
-            except Exception as e:
-                print(f"⚠️ خطا در دریافت پیام‌های کانال {channel}: {e}")
-                continue
-            if new_messages:
-                set_last_msg_id(channel, max_id)
-                print(f"📨 {channel}: {len(new_messages)} پیام جدید (آخرین ID: {max_id})")
-            else:
-                print(f"📨 {channel}: پیام جدیدی یافت نشد.")
-            
-            for msg in new_messages:
-                if msg.text:
-                    found = re.findall(r'(?:vless|vmess|trojan|ss)://\S+', msg.text)
-                    for link in found:
-                        if is_us_location_config(link):
-                            configs.add(link)
-
-    # === بخش دوم: دریافت از منابع وب و گیت‌هاب ===
-    print("\n🌐 در حال دریافت کانفیگ‌ها از منابع وب...")
-    for url in WEB_SOURCES:
-        try:
-            resp = requests.get(url, timeout=15)
-            if resp.status_code == 200:
-                text_content = resp.text.strip()
-                
-                # تلاش برای تبدیل از Base64 به متن ساده
-                try:
-                    decoded_text = base64.b64decode(text_content).decode('utf-8')
-                    text_content = decoded_text
-                except Exception:
-                    pass  # اگر فایل Base64 نبود و متن ساده بود، مشکلی نیست
-                    
-                found = re.findall(r'(?:vless|vmess|trojan|ss)://\S+', text_content)
-                
-                valid_web_configs = 0
-                for link in found:
-                    if is_us_location_config(link):
-                        configs.add(link)
-                        valid_web_configs += 1
-                
-                source_name = url.split('/')[-1]
-                print(f"🔗 منبع {source_name}: {len(found)} کانفیگ یافت شد، {valid_web_configs} مورد منطبق با آمریکا و بدون CDN.")
-            else:
-                print(f"⚠️ خطا در دریافت از وب (کد {resp.status_code}) برای: {url}")
-        except Exception as e:
-            print(f"⚠️ خطای ارتباط با منبع وب: {e}")
-
-    return list(configs)
 
 def init_run_counter():
     conn = sqlite3.connect(DB_FILE)
@@ -348,6 +267,103 @@ def get_expired_configs(limit):
     rows = c.fetchall()
     conn.close()
     return rows
+
+# ---------------- استخراج کانفیگ‌ها با سیستم آمارگیری ----------------
+def extract_configs():
+    configs = set()
+    total_found = 0
+    cdn_blocked = 0
+    non_us = 0
+    invalid = 0
+    
+    # === بخش اول: دریافت از کانال‌های تلگرام ===
+    print("📡 در حال دریافت کانفیگ‌ها از تلگرام...")
+    with client:
+        for channel in CHANNELS:
+            last_id = get_last_msg_id(channel)
+            new_messages = []
+            max_id = last_id
+            try:
+                messages = client.iter_messages(channel, limit=200, min_id=last_id + 1, reverse=False)
+                for msg in messages:
+                    new_messages.append(msg)
+                    if msg.id > max_id:
+                        max_id = msg.id
+            except Exception as e:
+                print(f"⚠️ خطا در دریافت پیام‌های کانال {channel}: {e}")
+                continue
+                
+            if new_messages:
+                set_last_msg_id(channel, max_id)
+                print(f"📨 {channel}: {len(new_messages)} پیام جدید (آخرین ID: {max_id})")
+            else:
+                print(f"📨 {channel}: پیام جدیدی یافت نشد.")
+            
+            for msg in new_messages:
+                if msg.text:
+                    found = re.findall(r'(?:vless|vmess|trojan|ss)://\S+', msg.text)
+                    total_found += len(found)
+                    for link in found:
+                        is_valid, reason = check_config_location(link)
+                        if is_valid:
+                            configs.add(link)
+                        elif "CDN_Blocked" in reason:
+                            cdn_blocked += 1
+                        elif "Non_US" in reason:
+                            non_us += 1
+                        else:
+                            invalid += 1
+
+    # === بخش دوم: دریافت از منابع وب و گیت‌هاب ===
+    print("\n🌐 در حال دریافت کانفیگ‌ها از منابع وب...")
+    for url in WEB_SOURCES:
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                text_content = resp.text.strip()
+                try:
+                    decoded_text = base64.b64decode(text_content).decode('utf-8')
+                    text_content = decoded_text
+                except Exception:
+                    pass
+                    
+                found = re.findall(r'(?:vless|vmess|trojan|ss)://\S+', text_content)
+                total_found += len(found)
+                
+                web_valid = 0
+                web_cdn = 0
+                web_non_us = 0
+                
+                for link in found:
+                    is_valid, reason = check_config_location(link)
+                    if is_valid:
+                        configs.add(link)
+                        web_valid += 1
+                    elif "CDN_Blocked" in reason:
+                        web_cdn += 1
+                        cdn_blocked += 1
+                    elif "Non_US" in reason:
+                        web_non_us += 1
+                        non_us += 1
+                    else:
+                        invalid += 1
+                
+                source_name = url.split('/')[-1]
+                print(f"🔗 منبع {source_name}: {len(found)} کانفیگ یافت شد.")
+                print(f"   ✅ معتبر آمریکا: {web_valid} | 🚫 حذف (CDN/Cloudflare): {web_cdn} | 🌍 حذف (کشورهای دیگر): {web_non_us}")
+            else:
+                print(f"⚠️ خطا در دریافت از وب (کد {resp.status_code}) برای: {url}")
+        except Exception as e:
+            print(f"⚠️ خطای ارتباط با منبع وب: {e}")
+
+    # چاپ آمار نهایی استخراج
+    print(f"\n📊 آمار کلی استخراج: {total_found} کانفیگ بررسی شد.")
+    print(f"   ✅ تایید شده برای تست: {len(configs)}")
+    print(f"   🚫 فیلتر شده به دلیل شبکه توزیع محتوا (CDN): {cdn_blocked}")
+    print(f"   🌍 فیلتر شده به دلیل لوکیشن غیرآمریکا: {non_us}")
+    print(f"   ⚠️ نامعتبر / خطای DNS: {invalid}\n")
+
+    return list(configs)
 
 # ---------------- ابزار git ----------------
 def setup_git():
@@ -547,7 +563,6 @@ def parse_link_to_outbound(link):
                 }
 
             return outbound
-
     except Exception:
         return None
 
@@ -683,13 +698,11 @@ def perform_purge():
     print("🧹 شروع پالایش کامل کانفیگ‌های موجود...")
     if not os.path.exists(CONFIG_FILE):
         return
-
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         encoded = f.read().strip()
     if not encoded:
         set_run_counter(0)
         return
-
     try:
         decoded = base64.b64decode(encoded).decode("utf-8")
         links = [line.strip() for line in decoded.split("\n") if line.strip()]
@@ -733,10 +746,9 @@ if __name__ == "__main__":
 
     print(f"📊 شمارنده اجرا: {counter} / {PURGE_INTERVAL} → اجرای عادی")
     raw = extract_configs()
-    print(f"\n📋 در مجموع {len(raw)} کانفیگ یکتا استخراج و برای تست آماده شد.\n")
 
     if not raw:
-        print("⚠️ هیچ کانفیگ سالمی پیدا نشد!")
+        print("⚠️ هیچ کانفیگ سالمی با شروط فعلی (آمریکا + بدون CDN) پیدا نشد!")
         set_run_counter(counter + 1)
         exit(1)
 
